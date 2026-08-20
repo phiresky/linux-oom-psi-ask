@@ -1,0 +1,19 @@
+[package]
+name = "psi-ask"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive userspace OOM handler: watches PSI memory pressure and asks which process to kill"
+license = "MIT"
+
+[dependencies]
+async-channel = "2.5.0"
+clap = { version = "4.6.6", features = ["derive"] }
+flate2 = "1.1.9"
+gtk4 = { version = "0.11.4", features = ["v4_12"] }
+gtk4-layer-shell = "0.8.1"
+libc = "0.2"
+regex = "1.13.1"
+
+[profile.release]
+lto = true
+strip = true

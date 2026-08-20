@@ -1,0 +1,18 @@
+[Unit]
+Description=psi-ask — interactive memory-pressure dialog
+Documentation=https://docs.kernel.org/accounting/psi.html
+# tie to the Wayland session so it starts/stops with it
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/psi-ask
+Restart=on-failure
+RestartSec=5
+# keep our pages out of reclaim and swap while the system thrashes
+MemoryMin=128M
+MemoryLow=128M
+MemorySwapMax=0
+
+[Install]
+WantedBy=graphical-session.target
