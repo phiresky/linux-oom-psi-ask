@@ -358,7 +358,19 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGINT, on_fatal_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_fatal_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGHUP, on_fatal_signal as *const () as libc::sighandler_t);
+        // Aborts too: a panic inside a glib callback cannot unwind through
+        // the C main loop and becomes abort(), and the allocator aborts on
+        // OOM — exactly the regime we operate in. Without this, SIGSTOPped
+        // victims would stay frozen forever.
+        libc::signal(libc::SIGABRT, on_fatal_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGSEGV, on_fatal_signal as *const () as libc::sighandler_t);
     }
+    // Unwinding panics (plain threads): resume before the default report.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        resume_all();
+        default_hook(info);
+    }));
 }
 
 fn pause_pid(pid: i32) -> bool {
@@ -507,11 +519,15 @@ fn collect_candidates(
         // (TASK_COMM_LEN), e.g. Firefox's "Isolated Web Co".
         path.clear();
         let _ = write!(path, "/proc/{pid}/cmdline");
-        let cmdline = match slurp(&path, scratch) {
-            Some(s) if !s.is_empty() => {
+        // Lossy, not read_to_string: argv can contain non-UTF-8 bytes (e.g. a
+        // latin-1 filename), and a hard UTF-8 error would silently drop the
+        // process from the list.
+        let cmdline = match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                let s = String::from_utf8_lossy(&bytes);
                 s.trim_end_matches('\0').replace('\0', " ").trim().to_string()
             }
-            _ => continue,
+            _ => continue, // kernel thread (empty) or process vanished
         };
         path.clear();
         let _ = write!(path, "/proc/{pid}/statm");
@@ -576,15 +592,21 @@ struct DialogCandidate {
 struct PressureEvent {
     /// "system" or the cgroup name that fired
     source: String,
+    /// the pressure file that fired — the countdown gates on ITS avg10, not
+    /// the global one (a thrashing cgroup must not be dismissed just because
+    /// system-wide pressure looks fine, and vice versa)
+    pressure_path: String,
     psi_line: String,
     cands: Vec<DialogCandidate>,
 }
 
-fn kill_pid(pid: i32, comm: &str, sig: i32) {
+/// Returns whether the signal was delivered.
+fn kill_pid(pid: i32, comm: &str, sig: i32) -> bool {
     let signame = if sig == libc::SIGKILL { "SIGKILL" } else { "SIGTERM" };
     let r = unsafe { libc::kill(pid, sig) };
     if r == 0 {
         println!("sent {signame} to {pid} ({comm})");
+        true
     } else {
         let e = io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EPERM) {
@@ -594,6 +616,7 @@ fn kill_pid(pid: i32, comm: &str, sig: i32) {
         } else {
             eprintln!("error: kill({pid}) failed: {e}");
         }
+        false
     }
 }
 
@@ -629,6 +652,7 @@ fn monitor_loop(
             continue; // single-window blip, debounced away
         }
         let source = sources[idx].label.clone();
+        let pressure_path = sources[idx].pressure_path.clone();
         let psi_line = slurp(&sources[idx].pressure_path, &mut scratch)
             .and_then(|s| s.lines().find(|l| l.starts_with(cfg.kind.as_str())))
             .unwrap_or("")
@@ -689,7 +713,10 @@ fn monitor_loop(
                     }
                 });
             }
-            if ev_tx.send_blocking(PressureEvent { source, psi_line, cands }).is_err() {
+            if ev_tx
+                .send_blocking(PressureEvent { source, pressure_path, psi_line, cands })
+                .is_err()
+            {
                 resume_all();
                 return; // GUI is gone
             }
@@ -944,7 +971,12 @@ struct Ui {
     answer_timeout: Duration,
     /// avg10 % below which the timeout may dismiss the dialog
     dismiss_below: f64,
-    hist: History,
+    /// PSI line kind ("some"/"full") for re-reading the source's avg10
+    kind: String,
+    /// pressure file of the event on display; the countdown gates on this
+    event_pressure_path: RefCell<String>,
+    /// preallocated buffer for the once-per-second pressure re-read
+    psi_scratch: RefCell<String>,
     /// pid → (name label, paused) of the rows on display, for live renames
     row_names: RefCell<HashMap<i32, (Label, bool)>>,
 }
@@ -961,15 +993,31 @@ fn name_markup(name: &str, paused: bool) -> String {
 /// Act on the user's choice (or None = do nothing), unfreeze everything,
 /// hide the dialog and let the monitor thread re-arm.
 fn finish(ui: &Rc<Ui>, choice: Option<(i32, String, i32)>) {
-    if !ui.active.replace(false) {
+    if !ui.active.get() {
         return;
     }
+    match choice {
+        Some((pid, comm, sig)) => {
+            if !kill_pid(pid, &comm, sig) {
+                // Signal not delivered (usually EPERM without caps): keep the
+                // dialog open — closing would silently resume everything and
+                // burn a cooldown while the pressure persists. Cancel the
+                // auto-dismiss so the message stays visible; the user can try
+                // another row or dismiss explicitly.
+                if let Some(id) = ui.timer.borrow_mut().take() {
+                    id.remove();
+                }
+                ui.countdown_label.set_text(&format!(
+                    "Could not signal {pid} ({comm}) — run ./install-caps.sh once"
+                ));
+                return;
+            }
+        }
+        None => println!("doing nothing."),
+    }
+    ui.active.set(false);
     if let Some(id) = ui.timer.borrow_mut().take() {
         id.remove();
-    }
-    match choice {
-        Some((pid, comm, sig)) => kill_pid(pid, &comm, sig),
-        None => println!("doing nothing."),
     }
     // Always resume: survivors get unfrozen, and a SIGTERM we just sent is
     // only delivered once the stopped target is continued.
@@ -984,6 +1032,7 @@ fn show_event(ui: &Rc<Ui>, ev: PressureEvent) {
     } else {
         ui.psi_label.set_text(&format!("cgroup {}: {}", ev.source, ev.psi_line));
     }
+    *ui.event_pressure_path.borrow_mut() = ev.pressure_path;
     while let Some(child) = ui.list.first_child() {
         ui.list.remove(&child);
     }
@@ -1045,14 +1094,18 @@ fn show_event(ui: &Rc<Ui>, ev: PressureEvent) {
         let ui2 = ui.clone();
         let id = glib::timeout_add_seconds_local(1, move || {
             // Only count down while pressure is actually easing; while it
-            // stays over the threshold the dialog stays put.
-            let current_psi = ui2
-                .hist
-                .lock()
-                .unwrap()
-                .back()
-                .map(|s| s.psi_pct as f64)
-                .unwrap_or(0.0);
+            // stays over the threshold the dialog stays put. Read the avg10
+            // of the source that fired (a cgroup's memory.pressure or the
+            // global file) — the global history would let a still-thrashing
+            // cgroup dialog dismiss itself, and unrelated global pressure
+            // would pin a cgroup dialog open. If the file vanished (cgroup
+            // removed), 0.0 lets the countdown run out normally.
+            let current_psi = {
+                let mut scratch = ui2.psi_scratch.borrow_mut();
+                slurp(&ui2.event_pressure_path.borrow(), &mut scratch)
+                    .map(|t| avg10_of(&ui2.kind, t))
+                    .unwrap_or(0.0)
+            };
             if current_psi >= ui2.dismiss_below {
                 ui2.remaining.set(ui2.answer_timeout.as_secs());
                 ui2.countdown_label
@@ -1261,7 +1314,9 @@ fn build_ui(
         done_tx,
         answer_timeout: cfg.answer_timeout,
         dismiss_below: threshold_pct(cfg),
-        hist: hist.clone(),
+        kind: cfg.kind.clone(),
+        event_pressure_path: RefCell::new(PSI_MEMORY.into()),
+        psi_scratch: RefCell::new(String::with_capacity(8 * 1024)),
         row_names: RefCell::new(HashMap::new()),
     });
 
