@@ -54,7 +54,12 @@ answer.
 
 ## Low Effort Warning
 
-This is a low-effort project, with the goal of "works for me". It's pretty hard to test this kind of thing because real memory pressure is hard to emulate, so I don't know if it works for all situations. The code is made with AI help.
+Compared to some of my other projects this is a low-effort project, with the goal of "works for me". The code is made with AI help. It's pretty hard to test this kind of thing because real memory pressure is hard to emulate, so I don't know if it works for all situations. It only supports Wayland right now.
+
+Pressure stall information is pretty guaranteed to be the right trigger because it simply checks how much CPU usage is being spent waiting for memory pages to be moved in and out of RAM. But it might be set too sensitive in the default.
+
+The pausing of processes is not guaranteed to make the system responsive because the thrashing can theoretically come from any selection of processes, not just the highest memory consumers.
+
 
 ## Prior art
 

@@ -390,6 +390,55 @@ fn resume_all() {
     }
 }
 
+/// The Wayland compositor renders our dialog — pausing it would freeze the
+/// screen with the question on it. Find it as the owner of the
+/// $WAYLAND_DISPLAY socket: /proc/net/unix gives the socket inodes bound to
+/// that path, and the process holding one of them as an fd is the
+/// compositor. (The ancestor-chain exemption doesn't cover it when psi-ask
+/// runs as a systemd user service.)
+fn wayland_compositor_pid() -> Option<i32> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    let path = if disp.starts_with('/') { disp } else { format!("{dir}/{disp}") };
+    let unix = fs::read_to_string("/proc/net/unix").ok()?;
+    let inodes: HashSet<&str> = unix
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let inode = f.nth(6)?;
+            (f.next()? == path).then_some(inode)
+        })
+        .collect();
+    if inodes.is_empty() {
+        return None;
+    }
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            if let Ok(target) = fs::read_link(fd.path()) {
+                if let Some(t) = target.to_str() {
+                    if t.strip_prefix("socket:[")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .is_some_and(|ino| inodes.contains(ino))
+                    {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Processes the dialog itself depends on — never pause these regardless of
+/// how much memory they use.
+fn is_render_critical(comm: &str) -> bool {
+    matches!(comm, "Xwayland" | "dbus-daemon" | "dbus-broker" | "systemd")
+}
+
 /// Our ancestor chain (terminal, shell, systemd-run, ...) — never pause
 /// these or the user could no longer answer the prompt.
 fn ancestor_pids(scratch: &mut String) -> Vec<i32> {
@@ -563,6 +612,13 @@ fn monitor_loop(
     // mlockall(MCL_FUTURE) keeps it resident.
     let mut scratch = String::with_capacity(64 * 1024);
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    // Found once: the compositor lives as long as our Wayland connection.
+    let compositor = wayland_compositor_pid();
+    if let Some(pid) = compositor {
+        println!("compositor is pid {pid}; exempt from pausing");
+    } else {
+        eprintln!("warn: could not identify the Wayland compositor; relying on name-based pause exemptions");
+    }
 
     loop {
         let Some(idx) = wait_for_pressure(&mut sources, &cfg, &mut scratch) else {
@@ -609,6 +665,8 @@ fn monitor_loop(
                         && i < 5
                         && !(ff_main.is_some() && is_ff(&c))
                         && !ancestors.contains(&c.pid)
+                        && Some(c.pid) != compositor
+                        && !is_render_critical(&c.comm)
                         && pause_pid(c.pid);
                     DialogCandidate {
                         pid: c.pid,
